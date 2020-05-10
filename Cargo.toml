@@ -1,0 +1,12 @@
+[package]
+name = "single-writer"
+description = "An example of a single-writer design"
+repository = "https://github.com/gterzian/rust-single-writer-example"
+version = "0.0.0"
+authors = ["Gregory Terzian"]
+license = "MPL-2.0"
+edition = "2018"
+
+[dependencies]
+crossbeam-channel = "0.4"
+uuid = {version = "0.8", features = ["v4"]}

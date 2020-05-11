@@ -76,43 +76,41 @@ fn single_writer() {
 
     // Spawn the "order" service.
     let _ = thread::spawn(move || loop {
-        {
-            select! {
-                recv(order_request_receiver) -> msg => {
-                    match msg {
-                        Ok(OrderRequest::NewOrder(customer_id)) => {
-                            let order_id = OrderId(Uuid::new_v4());
+        select! {
+            recv(order_request_receiver) -> msg => {
+                match msg {
+                    Ok(OrderRequest::NewOrder(customer_id)) => {
+                        let order_id = OrderId(Uuid::new_v4());
 
-                            let msg = if existing_customers.contains(&customer_id) {
-                                PaymentRequest::NewOrder(order_id, CustomerType::Existing)
-                            } else {
-                                existing_customers.insert(customer_id.clone());
-                                PaymentRequest::NewOrder(order_id, CustomerType::New)
-                            };
-
-                            let _ = payment_request_sender.send(msg);
-
-                            pending_payment.insert(order_id.clone(), customer_id);
-                        }
-                        Ok(OrderRequest::ShutDown) => {
-                            assert!(pending_payment.is_empty());
-                            let _ = payment_request_sender.send(PaymentRequest::ShutDown);
-                            break;
-                        },
-                        Err(_) => panic!("Error receiving an order request."),
-                    }
-                },
-                recv(payment_result_receiver) -> msg => {
-                    match msg {
-                        Ok(PaymentResult(id, succeeded)) => {
-                            let customer_id = pending_payment.remove(&id).expect("Payment result received for unknown order.");
+                        let msg = if existing_customers.contains(&customer_id) {
+                            PaymentRequest::NewOrder(order_id, CustomerType::Existing)
+                        } else {
                             existing_customers.insert(customer_id.clone());
-                            let _ = order_result_sender.send(OrderResult(customer_id, succeeded));
-                        }
-                        _ => panic!("Error receiving a payment result."),
+                            PaymentRequest::NewOrder(order_id, CustomerType::New)
+                        };
+
+                        let _ = payment_request_sender.send(msg);
+
+                        pending_payment.insert(order_id.clone(), customer_id);
                     }
-                },
-            }
+                    Ok(OrderRequest::ShutDown) => {
+                        assert!(pending_payment.is_empty());
+                        let _ = payment_request_sender.send(PaymentRequest::ShutDown);
+                        break;
+                    },
+                    Err(_) => panic!("Error receiving an order request."),
+                }
+            },
+            recv(payment_result_receiver) -> msg => {
+                match msg {
+                    Ok(PaymentResult(id, succeeded)) => {
+                        let customer_id = pending_payment.remove(&id).expect("Payment result received for unknown order.");
+                        existing_customers.insert(customer_id.clone());
+                        let _ = order_result_sender.send(OrderResult(customer_id, succeeded));
+                    }
+                    _ => panic!("Error receiving a payment result."),
+                }
+            },
         }
     });
 

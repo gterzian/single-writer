@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate crossbeam_channel;
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::unbounded;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::thread;
@@ -38,10 +38,14 @@ enum CustomerType {
 /// to the "fraud" service.
 enum FraudCheck {
     /// Check an order for fraud.
-    CheckOrder(OrderId, Sender<bool>),
+    CheckOrder(OrderId),
     /// We're shutting down.
     ShutDown,
 }
+
+/// The result of making a fraud check,
+/// sent by the "fraud" service, to the "payment" service.
+struct FraudCheckResult(OrderId, bool);
 
 /// Messages sent from the "order" service,
 /// to the "payment" service.
@@ -63,6 +67,7 @@ fn single_writer() {
     let (payment_request_sender, payment_request_receiver) = unbounded();
     let (payment_result_sender, payment_result_receiver) = unbounded();
     let (fraud_check_sender, fraud_check_receiver) = unbounded();
+    let (fraud_check_result_sender, fraud_check_result_receiver) = unbounded();
     let (order_request_sender, order_request_receiver) = unbounded();
 
     // A map of orders pending payment, owned by the "order" service.
@@ -119,12 +124,12 @@ fn single_writer() {
     // Spawn the "fraud" service.
     let _ = thread::spawn(move || loop {
         match fraud_check_receiver.recv() {
-            Ok(FraudCheck::CheckOrder(order_id, result_sender)) => {
+            Ok(FraudCheck::CheckOrder(order_id)) => {
                 // First, check for fraud.
                 let result = check_for_fraud(&order_id);
 
                 // Send the result.
-                let _ = result_sender.send(result);
+                let _ = fraud_check_result_sender.send(FraudCheckResult(order_id, result));
             }
             Ok(FraudCheck::ShutDown) => {
                 break;
@@ -133,32 +138,47 @@ fn single_writer() {
         }
     });
 
+    // A set of orders from first customer,
+    // that are awaiting a fraud check.
+    let mut awaiting_fraud_check = HashSet::new();
+
     // Spawn the "payment" service.
     let _ = thread::spawn(move || loop {
-        match payment_request_receiver.recv() {
-            Ok(PaymentRequest::NewOrder(order_id, customer_type)) => {
-                match customer_type {
-                    CustomerType::Existing => {
-                        // Process the payment for a new order without checking.
-                        let _ = payment_result_sender.send(PaymentResult(order_id, true));
+        select! {
+            recv(payment_request_receiver) -> msg => {
+                match msg {
+                    Ok(PaymentRequest::NewOrder(order_id, customer_type)) => {
+                        match customer_type {
+                            CustomerType::Existing => {
+                                // Process the payment for a new order without checking.
+                                let _ = payment_result_sender.send(PaymentResult(order_id, true));
+                            }
+                            CustomerType::New => {
+                                // Check for fraud.
+                                awaiting_fraud_check.insert(order_id.clone());
+                                let msg = FraudCheck::CheckOrder(order_id);
+                                let _ = fraud_check_sender.send(msg);
+                            }
+                        }
                     }
-                    CustomerType::New => {
-                        // First, check for fraud.
-                        let (result_sender, result_receiver) = unbounded();
-                        let msg = FraudCheck::CheckOrder(order_id.clone(), result_sender);
-                        let _ = fraud_check_sender.send(msg);
-                        let result = result_receiver.recv().expect("Couldn't check for fraud.");
+                    Ok(PaymentRequest::ShutDown) => {
+                        let _ = fraud_check_sender.send(FraudCheck::ShutDown);
+                        break;
+                    }
+                    Err(_) => panic!("Error receiving a payment request."),
+                }
+            },
+            recv(fraud_check_result_receiver) -> msg => {
+                match msg {
+                    Ok(FraudCheckResult(order_id, result)) => {
+                        assert!(awaiting_fraud_check.remove(&order_id));
 
                         // Send the result.
                         let _ = payment_result_sender.send(PaymentResult(order_id, result));
-                    }
+                    },
+                    Err(_) => panic!("Error receiving a fraud check result."),
                 }
-            }
-            Ok(PaymentRequest::ShutDown) => {
-                let _ = fraud_check_sender.send(FraudCheck::ShutDown);
-                break;
-            }
-            Err(_) => panic!("Error receiving a payment request."),
+            },
         }
     });
 

@@ -3,8 +3,9 @@ extern crate crossbeam_channel;
 
 use crossbeam_channel::unbounded;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn main() {}
@@ -28,11 +29,17 @@ enum OrderRequest {
 /// sent by the "order" service, to the "basket" service.
 struct OrderResult(CustomerId, bool);
 
+enum CustomerType {
+    Existing,
+    New,
+}
+
 /// Messages sent from the "order" service,
 /// to the "payment" service.
 enum PaymentRequest {
-    /// Attempt a payment for an order.
-    NewOrder(OrderId),
+    /// Attempt a payment for an order,
+    /// with a flag indicating whether it's a new customer.
+    NewOrder(OrderId, CustomerType),
     /// We're shutting down.
     ShutDown,
 }
@@ -50,6 +57,7 @@ fn single_writer() {
 
     // A map of orders pending payment, owned by the "order" service.
     let mut pending_payment = HashMap::new();
+    let mut existing_customers = HashSet::new();
 
     // Spawn the "order" service.
     let _ = thread::spawn(move || loop {
@@ -59,8 +67,16 @@ fn single_writer() {
                     match msg {
                         Ok(OrderRequest::NewOrder(customer_id)) => {
                             let order_id = OrderId(Uuid::new_v4());
+
+                            let msg = if existing_customers.contains(&customer_id) {
+                                PaymentRequest::NewOrder(order_id, CustomerType::Existing)
+                            } else {
+                                PaymentRequest::NewOrder(order_id, CustomerType::New)
+                            };
+
+                            let _ = payment_request_sender.send(msg);
+
                             pending_payment.insert(order_id.clone(), customer_id);
-                            let _ = payment_request_sender.send(PaymentRequest::NewOrder(order_id));
                         }
                         Ok(OrderRequest::ShutDown) => {
                             assert!(pending_payment.is_empty());
@@ -74,6 +90,7 @@ fn single_writer() {
                     match msg {
                         Ok(PaymentResult(id, succeeded)) => {
                             let customer_id = pending_payment.remove(&id).expect("Payment result received for unknown order.");
+                            existing_customers.insert(customer_id.clone());
                             let _ = order_result_sender.send(OrderResult(customer_id, succeeded));
                         }
                         _ => panic!("Error receiving a payment result."),
@@ -83,12 +100,28 @@ fn single_writer() {
         }
     });
 
+    fn check_for_fraud(_order: &OrderId) -> bool {
+        thread::sleep(Duration::from_millis(100));
+        true
+    }
+
     // Spawn the "payment" service.
     let _ = thread::spawn(move || loop {
         match payment_request_receiver.recv() {
-            Ok(PaymentRequest::NewOrder(order_id)) => {
-                // Process the payment for a new order.
-                let _ = payment_result_sender.send(PaymentResult(order_id, true));
+            Ok(PaymentRequest::NewOrder(order_id, customer_type)) => {
+                match customer_type {
+                    CustomerType::Existing => {
+                        // Process the payment for a new order without checking.
+                        let _ = payment_result_sender.send(PaymentResult(order_id, true));
+                    }
+                    CustomerType::New => {
+                        // First, check for fraud.
+                        let result = check_for_fraud(&order_id);
+
+                        // Send the result.
+                        let _ = payment_result_sender.send(PaymentResult(order_id, result));
+                    }
+                }
             }
             Ok(PaymentRequest::ShutDown) => {
                 break;
@@ -101,17 +134,22 @@ fn single_writer() {
     // owned by the "basket" service.
     let mut pending_orders = HashMap::new();
 
+    // Create four customers.
     for _ in 0..4 {
         let customer_id = CustomerId(Uuid::new_v4());
-        match pending_orders.entry(customer_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(1);
-            }
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() += 1;
-            }
-        };
-        let _ = order_request_sender.send(OrderRequest::NewOrder(customer_id));
+
+        // Send two orders per customer.
+        for _ in 0..2 {
+            match pending_orders.entry(customer_id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(1);
+                }
+                Entry::Occupied(mut entry) => {
+                    *entry.get_mut() += 1;
+                }
+            };
+            let _ = order_request_sender.send(OrderRequest::NewOrder(customer_id));
+        }
     }
 
     // Have the main thread of the test double-up as the "basket" service.
